@@ -17,6 +17,8 @@ import java.util.concurrent.TimeUnit;
  */
 public class UniqueGroupProcessingEventQueue {
     private final BlockingQueue<ProcessingEvent> queue;
+    // first priority contains events from unblocked groups
+    // it's guaranteed that it will contain no more than one event from any group
     private final Queue<ProcessingEvent> firstPriority = new ConcurrentLinkedQueue<>();
     private Map<Long, Queue<ProcessingEvent>> blockedEvents = new HashMap<>();
     private volatile boolean poolingFromSource = true;
@@ -29,11 +31,9 @@ public class UniqueGroupProcessingEventQueue {
      * postpone events of group
      * @param groupId
      */
-    public void blockGroup(Long groupId) {
-        synchronized (blockedEvents) {
-            if (blockedEvents.containsKey(groupId)) return;
-            blockedEvents.put(groupId, new ArrayDeque<>());
-        }
+    private void blockGroup(Long groupId) {
+        if (blockedEvents.containsKey(groupId)) return;
+        blockedEvents.put(groupId, new ArrayDeque<>());
     }
 
     /**
@@ -43,26 +43,24 @@ public class UniqueGroupProcessingEventQueue {
     public void unblockGroup(Long groupId) {
         synchronized (blockedEvents) {
             if (!blockedEvents.containsKey(groupId)) return;
-            firstPriority.addAll(blockedEvents.get(groupId));
-            blockedEvents.remove(groupId);
+            ProcessingEvent event = blockedEvents.get(groupId).poll();
+            if (event != null) firstPriority.add(event);
+            if (blockedEvents.get(groupId).isEmpty()) blockedEvents.remove(groupId);
         }
     }
 
     /**
+     * return next event and blocks all further events of same groupId
      * @see java.util.concurrent.BlockingQueue#poll(long, java.util.concurrent.TimeUnit)
+     * @see #unblockGroup(Long)
      */
     public ProcessingEvent poll(int timeout, TimeUnit unit) throws InterruptedException {
         long periodEnd = unit.toNanos(timeout) + System.nanoTime();
 
-        ProcessingEvent event = null;
-        while (event == null && !firstPriority.isEmpty()) {
-            event = firstPriority.poll();
+        ProcessingEvent event = firstPriority.poll();
+        if (event != null) {
             synchronized (blockedEvents) {
-                if (blockedEvents.containsKey(event.getGroupId())) {
-                    blockedEvents.get(event.getGroupId()).add(event);
-                    event = null;
-                    continue;
-                }
+                blockGroup(event.getGroupId());
             }
         }
 
@@ -75,7 +73,9 @@ public class UniqueGroupProcessingEventQueue {
                 if (blockedEvents.containsKey(event.getGroupId())) {
                     blockedEvents.get(event.getGroupId()).add(event);
                     event = null;
+                    continue;
                 }
+                blockGroup(event.getGroupId());
             }
         }
         return event;

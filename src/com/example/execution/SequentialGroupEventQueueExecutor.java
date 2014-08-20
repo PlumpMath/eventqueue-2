@@ -3,6 +3,7 @@ package com.example.execution;
 import com.example.ProcessingEvent;
 
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * <p>executes events from queue in multiple threads</p>
@@ -17,10 +18,10 @@ public class SequentialGroupEventQueueExecutor implements EventQueueExecutor {
     private Thread completionWatcher;
     private ExecutorService threadPool;
 
-    // manually track active threads to keep event order close to original
+    // manually track active threads to keep events order close to original
     // otherwise from group sequence {0,0,1,2,3,4} and single thread we get
     // {0,1,2,3,4,0}
-    private volatile int freeThreadCount = 0;
+    private AtomicLong freeThreadCount = new AtomicLong(0);
     private int threadCount;
 
     public SequentialGroupEventQueueExecutor(BlockingQueue<ProcessingEvent> queue, int threadCount) {
@@ -43,7 +44,7 @@ public class SequentialGroupEventQueueExecutor implements EventQueueExecutor {
         running = true;
         queue.startPolling();
         threadPool = Executors.newFixedThreadPool(threadCount);
-        freeThreadCount = threadCount;
+        freeThreadCount.set(threadCount);
         CompletionService<ProcessingEvent> completionService = new ExecutorCompletionService<>(threadPool);
         startQueuePollLoop(completionService);
         startCompletionWatchLoop(completionService);
@@ -57,16 +58,15 @@ public class SequentialGroupEventQueueExecutor implements EventQueueExecutor {
         new Thread(() -> {
             while (running || !queue.isEmpty()) {
                 try {
-                    if (freeThreadCount == 0) {
+                    if (freeThreadCount.get() == 0) {
                         Thread.sleep(POLL_PERIOD_MILLISECONDS);
                         continue;
                     }
                     ProcessingEvent event = queue.poll(POLL_PERIOD_MILLISECONDS, TimeUnit.MILLISECONDS);
                     if (event == null) continue;
-                    queue.blockGroup(event.getGroupId());
                     EventExecutor executor = EventExecutorFactory.make(event);
                     completionService.submit(executor);
-                    freeThreadCount--;
+                    freeThreadCount.decrementAndGet();
                 } catch (InterruptedException e) {
                     e.printStackTrace();
                 }
@@ -89,7 +89,7 @@ public class SequentialGroupEventQueueExecutor implements EventQueueExecutor {
                         continue;
                     }
                     onEventCompleted(future.get());
-                    freeThreadCount++;
+                    freeThreadCount.incrementAndGet();
                 } catch (InterruptedException | ExecutionException e) {
                     e.printStackTrace();
                 }
